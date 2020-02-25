@@ -18,3 +18,7 @@ build/
 # vendor/
 
 .vscode/
+
+# terraform temp resources (terraform is used to create test datasets)
+**.terraform*
+**/terraform.tfstate*

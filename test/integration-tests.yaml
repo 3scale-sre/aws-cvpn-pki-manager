@@ -1,0 +1,28 @@
+---
+cases:
+  - name: Get AWS Client VPN users
+    url: http://localhost:8080/users
+    requestMethod: GET
+    # expectData:
+    #   # The 1 key in this object specifies the matcher we want
+    #   # to use to test the returned payload. In this case, we
+    #   # require the payload is exactly what we specify.
+    #   exactly:
+    #     okay: true
+    #     msg: 'a message'
+    # Assertions about the returned status code. Pass in
+    # an acceptable code or list of codes
+    expectStatus: 200
+  - name: Get AWS Client VPN CRL
+    url: http://localhost:8080/crl
+    requestMethod: GET
+    # expectData:
+    #   # The 1 key in this object specifies the matcher we want
+    #   # to use to test the returned payload. In this case, we
+    #   # require the payload is exactly what we specify.
+    #   exactly:
+    #     okay: true
+    #     msg: 'a message'
+    # Assertions about the returned status code. Pass in
+    # an acceptable code or list of codes
+    expectStatus: 200

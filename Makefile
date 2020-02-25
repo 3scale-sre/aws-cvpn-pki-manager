@@ -11,7 +11,7 @@ help:
 # LOCAL PLATFORM BUILD
 .PHONY: build
 build:
-	${CONTAINER_RUNTIME} build --tag $(IMAGE):$(TAG) .
+	$(MAKE) buildx PLATFORMS=$(shell go env GOARCH)
 
 .PHONY: push
 push:
@@ -29,7 +29,7 @@ ifeq ($(CONTAINER_RUNTIME),docker)
 	PUSHX_CMD = push $(IMAGE):$(TAG)
 else
 	BUILDX_CMD = build --platform ${PLATFORMS} --manifest $(IMAGE):$(TAG) .
-	PUSHX_CMD = manifest push $(IMAGE):$(TAG)
+	PUSHX_CMD = manifest push --all $(IMAGE):$(TAG)
 endif
 .PHONY: buildx
 buildx: ## cross-platfrom build 
@@ -38,3 +38,30 @@ buildx: ## cross-platfrom build
 .PHONY: pushx
 pushx:
 	$(CONTAINER_RUNTIME) $(PUSHX_CMD)
+
+# Dev Vault server
+VAULT_RELEASE = 1.19
+TF_CMD := $(CONTAINER_RUNTIME) run --rm -ti -v $$(pwd):/work -w /work --privileged --network host docker.io/hashicorp/terraform:light
+vault-up:
+	$(CONTAINER_RUNTIME) run --cap-add=IPC_LOCK -d --network host --name=dev-vault -e 'VAULT_DEV_ROOT_TOKEN_ID=myroot' docker.io/hashicorp/vault:$(VAULT_RELEASE)
+	cd test/tf-dataset1 && \
+		$(TF_CMD) init && \
+		$(TF_CMD) apply --auto-approve
+vault-down:
+	$(CONTAINER_RUNTIME) rm -f $$($(CONTAINER_RUNTIME) ps -aqf "name=dev-vault")
+	find test/ -type f -name "*.tfstate*" -exec rm -f {} \;
+
+# Dev ACPM server
+ACPM_CMD := $(CONTAINER_RUNTIME) run --network host -d --name=dev-acpm -v $$(pwd):/work -w /work debian:buster-slim build/aws-cvpn-pki-manager_amd64_$(ACPM_RELEASE) server
+acpm-up: build
+	$(CONTAINER_RUNTIME) run --network host -d --name=dev-acpm $(IMAGE):$(TAG) \
+		--vault-auth-token myroot --client-vpn-endpoint-id "placeholder" --vault-pki-paths pki
+acpm-down:
+	$(CONTAINER_RUNTIME) rm -f $$($(CONTAINER_RUNTIME) ps -aqf "name=dev-acpm")
+
+dev-up: vault-up acpm-up
+dev-down: acpm-down vault-down
+
+run-tests: dev-up
+	$(CONTAINER_RUNTIME) run --rm -ti --network host --privileged --name=curl-runnings -v $$(pwd):/work -w /work debian:buster-slim test/run-integration-tests.sh
+	$(MAKE) dev-down
