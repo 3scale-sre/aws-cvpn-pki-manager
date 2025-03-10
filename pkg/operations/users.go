@@ -55,14 +55,14 @@ func ListUsers(r *ListUsersRequest) (map[string][]Certificate, error) {
 			return nil, errors.Wrapf(err, "failed to parse certificate")
 		}
 
-		if cert.IsCA == true || isServerCertificate(cert) == true {
+		if cert.IsCA || isServerCertificate(cert) {
 			// Do not list the CA
 			continue
 		}
 
 		notBefore := cert.NotBefore.Local()
 		notAfter := cert.NotAfter.Local()
-		serial := strings.TrimSpace(getHexFormatted(cert.SerialNumber.Bytes(), "-"))
+		serial := strings.TrimSpace(getHexFormatted(cert.SerialNumber.Bytes()))
 		revoked, err := isRevoked(serial, crl)
 		if err != nil {
 			return nil, err
@@ -126,15 +126,18 @@ func RevokeUser(r *RevokeUserRequest) error {
 			VaultPKIPath:        r.VaultPKIPath,
 			ClientVPNEndpointID: r.ClientVPNEndpointID,
 		})
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func getHexFormatted(buf []byte, sep string) string {
+func getHexFormatted(buf []byte) string {
 	var ret bytes.Buffer
 	for _, cur := range buf {
 		if ret.Len() > 0 {
-			fmt.Fprintf(&ret, sep)
+			fmt.Fprintf(&ret, "-")
 		}
 		fmt.Fprintf(&ret, "%02x", cur)
 	}
@@ -148,7 +151,7 @@ func isRevoked(serial string, crl []byte) (bool, error) {
 	}
 	list := parsed.TBSCertList.RevokedCertificates
 	for _, crt := range list {
-		if serial == strings.TrimSpace(getHexFormatted(crt.SerialNumber.Bytes(), "-")) {
+		if serial == strings.TrimSpace(getHexFormatted(crt.SerialNumber.Bytes())) {
 			return true, nil
 		}
 	}

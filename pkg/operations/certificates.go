@@ -127,10 +127,10 @@ func revokeUserCertificates(client *api.Client, pki string, crts []Certificate, 
 
 	for n, crt := range crts {
 		// Do not revoke the last certificate
-		if n == len(crts)-1 && revokeAll == false {
+		if n == len(crts)-1 && !revokeAll {
 			break
 		}
-		if crt.Revoked == false {
+		if !crt.Revoked {
 			payload := make(map[string]interface{})
 			payload["serial_number"] = crt.SerialNumber
 			log.Printf("Revoked cert %s\n", crt.SerialNumber)

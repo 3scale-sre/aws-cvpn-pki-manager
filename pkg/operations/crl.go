@@ -69,6 +69,9 @@ func UpdateCRL(r *UpdateCRLRequest) ([]byte, error) {
 			Client:       r.Client,
 			VaultPKIPath: r.VaultPKIPath,
 		})
+	if err != nil {
+		return nil, err
+	}
 
 	// Upload new CRL to AWS Client VPN endpoint
 	svc := ec2.New(session.New())
