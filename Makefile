@@ -13,28 +13,22 @@ help:
 get-new-release:
 	@hack/new-release.sh v$(TAG)
 
-build-all-release: build
+docker-build:
+	${CONTAINER_TOOL} build . -t quay.io/3scale/aws-cvpn-pki-manager:v$(TAG) --build-arg release=$(TAG)
 
-push-all-release: push
-
-build-all-latest: build-latest
-
-push-all-latest: push-latest
-
-build-all: build
-
-build:
-	${CONTAINER_TOOL} manifest rm $(IMAGE):$(TAG) || echo "No manifest found"
-	${CONTAINER_TOOL} manifest create $(IMAGE):$(TAG)
-	${CONTAINER_TOOL} build \
-		--platform linux/amd64,linux/arm64 \
-		--manifest $(IMAGE):$(TAG) . -f Dockerfile
-
-push:
-	${CONTAINER_TOOL} manifest push $(IMAGE):$(TAG)
-
-build-latest: build
-	${CONTAINER_TOOL} tag $(IMAGE):$(TAG) $(IMAGE):latest
-
-push-latest: build-latest
-	${CONTAINER_TOOL} push $(IMAGE):latest
+# PLATFORMS defines the target platforms for  the manager image be build to provide support to multiple
+# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
+# - able to use docker buildx . More info: https://docs.docker.com/build/buildx/
+# - have enable BuildKit, More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# - be able to push the image for your registry (i.e. if you do not inform a valid value via IMG=<myregistry/image:<tag>> than the export will fail)
+# To properly provided solutions that supports more than one platform you should use this option.
+PLATFORMS ?= linux/arm64,linux/amd64
+.PHONY: docker-buildx
+docker-buildx: ## Build and push docker image for the manager for cross-platform support
+	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+	- ${CONTAINER_TOOL} buildx create --name builder
+	${CONTAINER_TOOL} buildx use builder
+	- ${CONTAINER_TOOL} buildx build --push --platform=$(PLATFORMS) --tag $(IMAGE):$(TAG) -f Dockerfile.cross .
+	- ${CONTAINER_TOOL} buildx rm builder
+	rm Dockerfile.cross
