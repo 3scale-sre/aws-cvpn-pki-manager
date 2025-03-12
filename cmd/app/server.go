@@ -42,7 +42,6 @@ type serverOptions struct {
 	AuthGithubUsers             []string
 	AuthGithubTeams             []string
 	LogMode                     string
-	LogDebug                    bool
 }
 
 var serverOpts serverOptions
@@ -61,13 +60,9 @@ func init() {
 	cobra.OnInitialize(initConfig)
 
 	// Logging opts
-	serverCmd.Flags().StringVar(&serverOpts.LogMode, "log-mode", "", "Production/Development")
+	serverCmd.Flags().StringVar(&serverOpts.LogMode, "log-mode", "", "production/development")
 	viper.BindPFlag("log-mode", serverCmd.Flags().Lookup("log-mode"))
-	viper.SetDefault("log-mode", "Production")
-
-	serverCmd.Flags().BoolVar(&serverOpts.LogDebug, "log-debug", false, "Set logs to debug")
-	viper.BindPFlag("log-debug", serverCmd.Flags().Lookup("log-debug"))
-	viper.SetDefault("log-debug", false)
+	viper.SetDefault("log-mode", "production")
 
 	// Server opts
 	serverCmd.Flags().StringVar(&serverOpts.port, "port", "", "Port to listen at")
@@ -157,40 +152,48 @@ func initConfig() {
 func runServer(cmd *cobra.Command, args []string) {
 
 	var logger logr.Logger
-	if viper.GetString("log-mode") == "Production" {
+	mode := viper.GetString("log-mode")
+	if mode == "production" {
 		zl, err := zap.NewProduction()
 		if err != nil {
-			panic(err)
+			log.Panic(err)
+		}
+		logger = zapr.NewLogger(zl)
+	} else if mode == "development" {
+		zl, err := zap.NewDevelopment()
+		if err != nil {
+			log.Panic(err)
 		}
 		logger = zapr.NewLogger(zl)
 	} else {
-		zl, err := zap.NewDevelopment()
-		if err != nil {
-			panic(err)
-		}
-		logger = zapr.NewLogger(zl)
+		log.Panicf("unkown log mode %s", mode)
 	}
 
+	var vc vault.AuthenticatedClient
 	if viper.IsSet("vault-auth-token") {
-		vc := &vault.TokenAuthenticatedClient{
+		vc = &vault.TokenAuthenticatedClient{
 			Address: viper.GetString("vault-addr"),
 			Token:   viper.GetString("vault-auth-token"),
 		}
-		start(vc, logger)
 	} else if viper.IsSet("vault-auth-approle-role-id") &&
 		viper.IsSet("vault-auth-approle-secret-id") &&
 		viper.IsSet("vault-auth-approle-backend-path") {
 
-		vc := &vault.ApproleAuthenticatedClient{
+		vc = &vault.ApproleAuthenticatedClient{
 			Address:     viper.GetString("vault-addr"),
 			RoleID:      viper.GetString("vault-auth-approle-role-id"),
 			SecretID:    viper.GetString("vault-auth-approle-secret-id"),
 			BackendPath: viper.GetString("vault-auth-approle-backend-path"),
 		}
-		start(vc, logger)
 	} else {
-		panic("Vault auth config options missing")
+		log.Panic("Vault auth config options missing")
 	}
+
+	// vault login
+	vc.GetClient(logger)
+
+	//start server
+	start(vc, logger)
 }
 
 func start(vc vault.AuthenticatedClient, logger logr.Logger) {
@@ -198,16 +201,16 @@ func start(vc vault.AuthenticatedClient, logger logr.Logger) {
 	// Start RotateCRL cron like task
 	c := cron.New()
 	c.AddFunc("@daily", func() {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			panic("Failed while creating Vault client")
+			log.Panic("Failed while creating Vault client")
 		}
-		err = operations.RotateCRL(
+		_, err = operations.RotateCRL(
 			&operations.RotateCRLRequest{
 				Client:              client,
 				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
 				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-			})
+			}, logger.WithValues("operation", "rotateCRL"))
 		if err != nil {
 			logger.Error(err, "Cron procesor failed trying to rotate the CRL")
 		} else {
@@ -220,6 +223,7 @@ func start(vc vault.AuthenticatedClient, logger logr.Logger) {
 	mux := mux.NewRouter()
 	mux.HandleFunc("/crl", getCRLHandler(vc, logger)).Methods(http.MethodGet)
 	mux.HandleFunc("/crl", updateCRLHandler(vc, logger)).Methods(http.MethodPost)
+	mux.HandleFunc("/crl/rotate", rotateCRLHandler(vc, logger)).Methods(http.MethodPost)
 	mux.HandleFunc("/issue/{user}", issueClientCertificateHandler(vc, logger)).Methods(http.MethodPost)
 	mux.HandleFunc("/revoke/{user}", revokeUserHandler(vc, logger)).Methods(http.MethodPost)
 	mux.HandleFunc("/users", listUsersHandler(vc, logger)).Methods(http.MethodGet)
@@ -230,7 +234,7 @@ func start(vc vault.AuthenticatedClient, logger logr.Logger) {
 
 	// Start the server
 	if err := http.ListenAndServe(":"+viper.GetString("port"), authMiddleware(loggedRouter, logger)); err != nil {
-		panic(err)
+		log.Panic(err)
 	} else {
 		logger.Info("Started server")
 		logger.Info(fmt.Sprintf("Listening on port :%v", viper.GetString("port")))
@@ -240,7 +244,7 @@ func start(vc vault.AuthenticatedClient, logger logr.Logger) {
 func issueClientCertificateHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		logger.WithValues("handler", "issueClientCertificateHandler")
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
 			reportHttpError("unable to get vault client",
 				err, http.StatusInternalServerError, w, logger)
@@ -275,7 +279,7 @@ func issueClientCertificateHandler(vc vault.AuthenticatedClient, logger logr.Log
 						VaultKVPath:         viper.GetString("vault-kv-path"),
 						CfgTplPath:          viper.GetString("config-template-path"),
 						Temporary:           true,
-					})
+					}, logger.WithValues("operation", "issueCertificate"))
 				if err != nil {
 					reportHttpError("unable to issue temporary client certificate for user "+vars["user"],
 						err, http.StatusInternalServerError, w, logger)
@@ -299,10 +303,10 @@ func issueClientCertificateHandler(vc vault.AuthenticatedClient, logger logr.Log
 					VaultKVPath:         viper.GetString("vault-kv-path"),
 					CfgTplPath:          viper.GetString("config-template-path"),
 					Temporary:           false,
-				})
+				}, logger.WithValues("operation", "issueCertificate"))
 			if err != nil {
-				http.Error(w, jsonOutput(map[string]string{"error": "couldn't issue client certificate for user " + vars["user"] + ":\n" + err.Error()}), http.StatusInternalServerError)
-				log.Println(err)
+				reportHttpError("couldn't issue client certificate for user "+vars["user"],
+					err, http.StatusInternalServerError, w, logger)
 				return
 			}
 			fmt.Fprintln(w, jsonOutput(map[string]string{"result": "success"}))
@@ -312,7 +316,7 @@ func issueClientCertificateHandler(vc vault.AuthenticatedClient, logger logr.Log
 
 func revokeUserHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
 			reportHttpError("unable to get vault client",
 				err, http.StatusInternalServerError, w, logger)
@@ -325,7 +329,7 @@ func revokeUserHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Ha
 				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
 				Username:            vars["user"],
 				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-			})
+			}, logger.WithValues("operation", "revokeUser"))
 		if err != nil {
 			reportHttpError("unable to revoke user "+vars["user"],
 				err, http.StatusInternalServerError, w, logger)
@@ -337,7 +341,7 @@ func revokeUserHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Ha
 
 func getCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
 			reportHttpError("unable to get vault client",
 				err, http.StatusInternalServerError, w, logger)
@@ -347,7 +351,7 @@ func getCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Handle
 			&operations.GetCRLRequest{
 				Client:       client,
 				VaultPKIPath: viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
-			})
+			}, logger.WithValues("operation", "getCRL"))
 		if err != nil {
 			reportHttpError("unable to retrieve the CRL",
 				err, http.StatusInternalServerError, w, logger)
@@ -359,7 +363,7 @@ func getCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Handle
 
 func updateCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
 			reportHttpError("unable to get vault client",
 				err, http.StatusInternalServerError, w, logger)
@@ -370,7 +374,31 @@ func updateCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Han
 				Client:              client,
 				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
 				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-			})
+			}, logger.WithValues("operation", "updateCRL"))
+		if err != nil {
+			reportHttpError("unable to update CRL",
+				err, http.StatusInternalServerError, w, logger)
+			return
+		}
+
+		fmt.Fprintln(w, jsonOutput(map[string]string{"crl": string(crl)}))
+	}
+}
+
+func rotateCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		client, err := vc.GetClient(logger)
+		if err != nil {
+			reportHttpError("unable to get vault client",
+				err, http.StatusInternalServerError, w, logger)
+			return
+		}
+		crl, err := operations.RotateCRL(
+			&operations.RotateCRLRequest{
+				Client:              client,
+				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
+				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
+			}, logger.WithValues("operation", "rotateCRL"))
 		if err != nil {
 			reportHttpError("unable to update CRL",
 				err, http.StatusInternalServerError, w, logger)
@@ -383,7 +411,7 @@ func updateCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Han
 
 func listUsersHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
 			reportHttpError("unable to get vault client",
 				err, http.StatusInternalServerError, w, logger)
@@ -393,7 +421,7 @@ func listUsersHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Han
 			&operations.ListUsersRequest{
 				Client:       client,
 				VaultPKIPath: viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
-			})
+			}, logger.WithValues("operation", "listUSers"))
 		if err != nil {
 			reportHttpError("unable to retrieve the user list",
 				err, http.StatusInternalServerError, w, logger)
@@ -411,7 +439,7 @@ func listUsersHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Han
 
 func healthzHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
 			reportHttpError("/healthz failed",
 				err, http.StatusInternalServerError, w, logger, "status", "ko")
@@ -422,7 +450,7 @@ func healthzHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.Handl
 			&operations.ListUsersRequest{
 				Client:       client,
 				VaultPKIPath: viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
-			})
+			}, logger.WithValues("operation", "healthz:listUsers"))
 		if err != nil {
 			reportHttpError("/healthz failed",
 				err, http.StatusInternalServerError, w, logger, "status", "ko")
@@ -626,7 +654,7 @@ func jsonOutput(rsp map[string]string) string {
 
 func reportHttpError(msg string, err error, statusCode int, w http.ResponseWriter, logger logr.Logger, keys ...string) {
 	if len(keys)%2 != 0 {
-		panic("odd number of extra keys in call to function ")
+		log.Panic("odd number of extra keys in call to function ")
 	}
 
 	rsp := map[string]string{

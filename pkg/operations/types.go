@@ -6,8 +6,8 @@ import "time"
 // vault cvpn-pki secret engine
 type Certificate struct {
 	SerialNumber   string    `json:"serial"`
-	IssuerCN       string    `json:"issuer-cn"`
-	SubjectCN      string    `json:"subject-cn"`
+	IssuerCN       string    `json:"issuerCN"`
+	SubjectCN      string    `json:"subjectCN"`
 	NotBefore      time.Time `json:"notBefore"`
 	NotAfter       time.Time `json:"notAfter"`
 	Revoked        bool      `json:"revoked"`

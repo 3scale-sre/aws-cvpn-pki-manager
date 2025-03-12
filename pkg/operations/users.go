@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"github.com/hashicorp/vault/api"
-	"github.com/pkg/errors"
 )
 
 // ListUsersRequest is the structure containing
@@ -21,11 +21,12 @@ type ListUsersRequest struct {
 }
 
 // ListUsers retrieves the list of all Client VPN users and certificates
-func ListUsers(r *ListUsersRequest) (map[string][]Certificate, error) {
+func ListUsers(r *ListUsersRequest, logger logr.Logger) (map[string][]Certificate, error) {
 	users := map[string][]Certificate{}
 
 	secret, err := r.Client.Logical().List(fmt.Sprintf("%s/certs", r.VaultPKIPath))
 	if err != nil {
+		logger.Error(err, "unable to list certificates")
 		return nil, err
 	}
 
@@ -34,25 +35,28 @@ func ListUsers(r *ListUsersRequest) (map[string][]Certificate, error) {
 		&GetCRLRequest{
 			Client:       r.Client,
 			VaultPKIPath: r.VaultPKIPath,
-		})
+		}, logger)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, key := range secret.Data["keys"].([]interface{}) {
+	for _, key := range secret.Data["keys"].([]any) {
 		secret, err := r.Client.Logical().Read(fmt.Sprintf("%s/cert/%s", r.VaultPKIPath, key))
 		if err != nil {
+			logger.Error(err, fmt.Sprintf("error in Vault call to %s/cert/%s", r.VaultPKIPath, key))
 			return nil, err
 		}
 		rawCert := secret.Data["certificate"].(string)
 		block, _ := pem.Decode([]byte(rawCert))
 		if block == nil {
-			return nil, errors.Wrapf(err, "failed to parse certificate PEM")
+			logger.Error(err, "failed to decode PEM certificate")
+			return nil, err
 		}
 
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse certificate")
+			logger.Error(err, "failed to parse certificate x509")
+			return nil, err
 		}
 
 		if cert.IsCA || isServerCertificate(cert) {
@@ -65,6 +69,7 @@ func ListUsers(r *ListUsersRequest) (map[string][]Certificate, error) {
 		serial := strings.TrimSpace(getHexFormatted(cert.SerialNumber.Bytes()))
 		revoked, err := isRevoked(serial, crl)
 		if err != nil {
+			logger.Error(err, "error in call to 'isRevoked'")
 			return nil, err
 		}
 
@@ -101,7 +106,7 @@ type RevokeUserRequest struct {
 }
 
 // RevokeUser revokes all the issued certificates for a given user
-func RevokeUser(r *RevokeUserRequest) error {
+func RevokeUser(r *RevokeUserRequest, logger logr.Logger) error {
 
 	// Get the list of users
 	users, err := ListUsers(
@@ -109,12 +114,12 @@ func RevokeUser(r *RevokeUserRequest) error {
 			Client:              r.Client,
 			VaultPKIPath:        r.VaultPKIPath,
 			ClientVPNEndpointID: r.ClientVPNEndpointID,
-		})
+		}, logger)
 	if err != nil {
 		return err
 	}
 
-	err = revokeUserCertificates(r.Client, r.VaultPKIPath, users[r.Username], true)
+	err = revokeUserCertificates(r.Client, r.VaultPKIPath, users[r.Username], true, logger)
 	if err != nil {
 		return err
 	}
@@ -125,7 +130,7 @@ func RevokeUser(r *RevokeUserRequest) error {
 			Client:              r.Client,
 			VaultPKIPath:        r.VaultPKIPath,
 			ClientVPNEndpointID: r.ClientVPNEndpointID,
-		})
+		}, logger)
 	if err != nil {
 		return err
 	}
@@ -144,14 +149,20 @@ func getHexFormatted(buf []byte) string {
 	return ret.String()
 }
 
-func isRevoked(serial string, crl []byte) (bool, error) {
-	parsed, err := x509.ParseCRL(crl)
+func isRevoked(serial string, crlPEM []byte) (bool, error) {
+	// PEM to DER
+	var crl []byte
+	block, _ := pem.Decode(crlPEM)
+	if block != nil && block.Type == "X509 CRL" {
+		crl = block.Bytes
+	}
+	// Parse CRL
+	list, err := x509.ParseRevocationList(crl)
 	if err != nil {
 		return false, err
 	}
-	list := parsed.TBSCertList.RevokedCertificates
-	for _, crt := range list {
-		if serial == strings.TrimSpace(getHexFormatted(crt.SerialNumber.Bytes())) {
+	for _, entry := range list.RevokedCertificateEntries {
+		if serial == strings.TrimSpace(getHexFormatted(entry.SerialNumber.Bytes())) {
 			return true, nil
 		}
 	}
