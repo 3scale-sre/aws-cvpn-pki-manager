@@ -1,34 +1,44 @@
-
-.PHONY: help
-
 TAG	?= local
 IMAGE	?= quay.io/3scale/aws-cvpn-pki-manager
-CONTAINER_TOOL ?= podman
+CONTAINER_RUNTIME ?= podman
 
+.PHONY: help
 help:
 	@$(MAKE) -pRrq -f $(lastword $(MAKEFILE_LIST)) : 2>/dev/null \
 		| awk -v RS= -F: '/^# File/,/^# Finished Make data base/ {if ($$1 !~ "^[#.]") {print $$1}}' \
 		| egrep -v -e '^[^[:alnum:]]' -e '^$@$$' | sort
 
+.PHONY: get-new-release
 get-new-release:
 	@hack/new-release.sh v$(TAG)
 
-docker-build:
-	${CONTAINER_TOOL} build . -t quay.io/3scale/aws-cvpn-pki-manager:v$(TAG) --build-arg release=$(TAG)
+# LOCAL PLATFORM BUILD
+.PHONY: build
+build:
+	${CONTAINER_RUNTIME} build --tag $(IMAGE):$(TAG) .
 
-# PLATFORMS defines the target platforms for  the manager image be build to provide support to multiple
-# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
-# - able to use docker buildx . More info: https://docs.docker.com/build/buildx/
-# - have enable BuildKit, More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-# - be able to push the image for your registry (i.e. if you do not inform a valid value via IMG=<myregistry/image:<tag>> than the export will fail)
-# To properly provided solutions that supports more than one platform you should use this option.
+.PHONY: push
+push:
+	$(CONTAINER_RUNTIME) push $(IMAGE):$(TAG)
+
+# MULTI-PLATFORM BUILD/PUSH
+# NOTE IF USING DOCKER (https://docs.docker.com/build/building/multi-platform/#prerequisites):
+#   The "classic" image store of the Docker Engine does not support multi-platform images. 
+#   Switching to the containerd image store ensures that your Docker Engine can push, pull,
+#   and build multi-platform images.
+# PLATFORMS defines the target platforms for mult-platform build.
 PLATFORMS ?= linux/arm64,linux/amd64
-.PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
-	- ${CONTAINER_TOOL} buildx create --name builder
-	${CONTAINER_TOOL} buildx use builder
-	- ${CONTAINER_TOOL} buildx build --push --platform=$(PLATFORMS) --tag $(IMAGE):$(TAG) -f Dockerfile.cross .
-	- ${CONTAINER_TOOL} buildx rm builder
-	rm Dockerfile.cross
+ifeq ($(CONTAINER_RUNTIME),docker)
+	BUILDX_CMD = build --platform ${PLATFORMS} --tag $(IMAGE):$(TAG) .
+	PUSHX_CMD = push $(IMAGE):$(TAG)
+else
+	BUILDX_CMD = build --platform ${PLATFORMS} --manifest $(IMAGE):$(TAG) .
+	PUSHX_CMD = manifest push $(IMAGE):$(TAG)
+endif
+.PHONY: buildx
+buildx: ## cross-platfrom build 
+	$(CONTAINER_RUNTIME) $(BUILDX_CMD)
+
+.PHONY: pushx
+pushx:
+	$(CONTAINER_RUNTIME) $(PUSHX_CMD)
