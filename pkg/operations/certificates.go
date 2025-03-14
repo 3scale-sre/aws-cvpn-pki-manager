@@ -27,7 +27,6 @@ type IssueCertificateRequest struct {
 	ClientVPNEndpointID string
 	VaultKVPath         string
 	CfgTplPath          string
-	Temporary           bool
 }
 
 // IssueClientCertificate generates a new certificate for a given users, causing
@@ -110,28 +109,26 @@ func IssueClientCertificate(r *IssueCertificateRequest, logger logr.Logger) (str
 		return "", err
 	}
 
-	if !r.Temporary {
-		// create/update the vpn config in the kv store
-		payload["data"] = map[string]string{
-			"content": config.String(),
-		}
-		_, err = r.Client.Logical().Write(fmt.Sprintf("%s/data/users/%s/config.ovpn", r.VaultKVPath, r.Username), payload)
-		if err != nil {
-			logger.Error(err, fmt.Sprintf("unable to update %s/data/users/%s/config.ovpn in KV2 store", r.VaultKVPath, r.Username))
-			return "", err
-		}
+	// create/update the vpn config in the kv store
+	payload["data"] = map[string]string{
+		"content": config.String(),
+	}
+	_, err = r.Client.Logical().Write(fmt.Sprintf("%s/data/users/%s/config.ovpn", r.VaultKVPath, r.Username), payload)
+	if err != nil {
+		logger.Error(err, fmt.Sprintf("unable to update %s/data/users/%s/config.ovpn in KV2 store", r.VaultKVPath, r.Username))
+		return "", err
+	}
 
-		// Call UpdateCRL to revoke all other certificates
-		_, err = UpdateCRL(
-			&UpdateCRLRequest{
-				Client:              r.Client,
-				VaultPKIPath:        r.VaultPKIPaths[len(r.VaultPKIPaths)-1],
-				ClientVPNEndpointID: r.ClientVPNEndpointID,
-			}, logger)
+	// Call UpdateCRL to revoke all other certificates
+	_, err = UpdateCRL(
+		&UpdateCRLRequest{
+			Client:              r.Client,
+			VaultPKIPath:        r.VaultPKIPaths[len(r.VaultPKIPaths)-1],
+			ClientVPNEndpointID: r.ClientVPNEndpointID,
+		}, logger)
 
-		if err != nil {
-			return "", err
-		}
+	if err != nil {
+		return "", err
 	}
 
 	return config.String(), nil

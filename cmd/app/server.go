@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/3scale/aws-cvpn-pki-manager/pkg/operations"
@@ -253,64 +252,31 @@ func issueClientCertificateHandler(vc vault.AuthenticatedClient, logger logr.Log
 
 		vars := mux.Vars(r)
 
-		var temp bool
-		if _, ok := r.URL.Query()["temp"]; ok {
-			temp, err = strconv.ParseBool(r.URL.Query()["temp"][0])
-			if err != nil {
-				reportHttpError("expected true/false for parameter 'temp'",
-					err, http.StatusInternalServerError, w, logger)
-				return
-			}
-
+		var role string
+		if param, ok := r.URL.Query()["role"]; ok {
+			// use the role specified in the request
+			role = param[0]
 		} else {
-			temp = false
+			// use the default role
+			role = viper.GetString("vault-client-certificate-role")
 		}
 
-		if temp {
-			if role, ok := r.URL.Query()["role"]; ok {
-				//do something here
-				cfg, err := operations.IssueClientCertificate(
-					&operations.IssueCertificateRequest{
-						Client:              client,
-						VaultPKIPaths:       viper.GetStringSlice("vault-pki-paths"),
-						VaultPKIRole:        role[0],
-						Username:            vars["user"],
-						ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-						VaultKVPath:         viper.GetString("vault-kv-path"),
-						CfgTplPath:          viper.GetString("config-template-path"),
-						Temporary:           true,
-					}, logger.WithValues("operation", "issueCertificate"))
-				if err != nil {
-					reportHttpError("unable to issue temporary client certificate for user "+vars["user"],
-						err, http.StatusInternalServerError, w, logger)
-					return
-				}
-				fmt.Fprintln(w, jsonOutput(map[string]string{"config": cfg}))
-			} else {
-				reportHttpError("no Vault PKI role provided to issue temporary client certificate",
-					err, http.StatusBadRequest, w, logger)
-				return
-			}
-
-		} else {
-			_, err = operations.IssueClientCertificate(
-				&operations.IssueCertificateRequest{
-					Client:              client,
-					VaultPKIPaths:       viper.GetStringSlice("vault-pki-paths"),
-					VaultPKIRole:        viper.GetString("vault-client-certificate-role"),
-					Username:            vars["user"],
-					ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-					VaultKVPath:         viper.GetString("vault-kv-path"),
-					CfgTplPath:          viper.GetString("config-template-path"),
-					Temporary:           false,
-				}, logger.WithValues("operation", "issueCertificate"))
-			if err != nil {
-				reportHttpError("couldn't issue client certificate for user "+vars["user"],
-					err, http.StatusInternalServerError, w, logger)
-				return
-			}
-			fmt.Fprintln(w, jsonOutput(map[string]string{"result": "success"}))
+		cfg, err := operations.IssueClientCertificate(
+			&operations.IssueCertificateRequest{
+				Client:              client,
+				VaultPKIPaths:       viper.GetStringSlice("vault-pki-paths"),
+				VaultPKIRole:        role,
+				Username:            vars["user"],
+				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
+				VaultKVPath:         viper.GetString("vault-kv-path"),
+				CfgTplPath:          viper.GetString("config-template-path"),
+			}, logger.WithValues("operation", "issueCertificate"))
+		if err != nil {
+			reportHttpError("unable to issue client certificate for user "+vars["user"],
+				err, http.StatusInternalServerError, w, logger)
+			return
 		}
+		fmt.Fprintln(w, jsonOutput(map[string]string{"result": "success", "config": cfg}))
 	}
 }
 
