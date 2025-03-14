@@ -8,10 +8,6 @@ help:
 		| awk -v RS= -F: '/^# File/,/^# Finished Make data base/ {if ($$1 !~ "^[#.]") {print $$1}}' \
 		| egrep -v -e '^[^[:alnum:]]' -e '^$@$$' | sort
 
-.PHONY: get-new-release
-get-new-release:
-	@hack/new-release.sh v$(TAG)
-
 # LOCAL PLATFORM BUILD
 .PHONY: build
 build:

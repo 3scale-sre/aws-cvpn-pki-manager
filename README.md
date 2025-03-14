@@ -26,20 +26,6 @@ This project works under the following premises:
 * Each user will only have one valid certificate at a given time. This means that when a new certificate is issued for an existent client, all other certificates that the user might have will be revoked, and only the new one will be valid from that moment on.
 
 
-## Getting Started (WIP)
-
-The fastest way to try out ACPM is to use the provided example in `examples/eks` which contains the terraform resources to install all the setup inside an AWS EKS managed Kubernetes cluster. This terraform will deploy the following resources for you:
-
-* A VPC with an EKS cluster inside it.
-* A Route53 hosted zone to host the cluster DNS records
-* A Client VPN endpoint connected to the VPC
-* A Vault instance inside the cluster, already configured with the required backends
-* A deployment of ACPM to manage the PKI
-
-This will provide you a full functioning environment to test ACPM capabilities.
-
-A serveless deployment of ACPM using Lambda and API Gateway will come in the future, stay tuned!
-
 ## Vault permissions
 
 The following vault policy is required for ACPM:
