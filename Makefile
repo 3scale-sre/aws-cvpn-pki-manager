@@ -41,6 +41,7 @@ pushx:
 
 # Dev Vault server
 VAULT_RELEASE = 1.19
+TEST_IMAGE = mirror.gcr.io/library/debian:bookworm-slim
 TF_CMD := $(CONTAINER_RUNTIME) run --rm -ti -v $$(pwd):/work -w /work --privileged --network host docker.io/hashicorp/terraform:light
 vault-up:
 	$(CONTAINER_RUNTIME) run --cap-add=IPC_LOCK -d --network host --name=dev-vault -e 'VAULT_DEV_ROOT_TOKEN_ID=myroot' docker.io/hashicorp/vault:$(VAULT_RELEASE)
@@ -52,7 +53,7 @@ vault-down:
 	find test/ -type f -name "*.tfstate*" -exec rm -f {} \;
 
 # Dev ACPM server
-ACPM_CMD := $(CONTAINER_RUNTIME) run --network host -d --name=dev-acpm -v $$(pwd):/work -w /work debian:buster-slim build/aws-cvpn-pki-manager_amd64_$(ACPM_RELEASE) server
+ACPM_CMD := $(CONTAINER_RUNTIME) run --network host -d --name=dev-acpm -v $$(pwd):/work -w $(TEST_IMAGE) build/aws-cvpn-pki-manager_amd64_$(ACPM_RELEASE) server
 acpm-up: build
 	$(CONTAINER_RUNTIME) run --network host -d --name=dev-acpm $(IMAGE):$(TAG) \
 		--vault-auth-token myroot --client-vpn-endpoint-id "placeholder" --vault-pki-paths pki
@@ -62,6 +63,6 @@ acpm-down:
 dev-up: vault-up acpm-up
 dev-down: acpm-down vault-down
 
-run-tests: dev-up
-	$(CONTAINER_RUNTIME) run --rm -ti --network host --privileged --name=curl-runnings -v $$(pwd):/work -w /work debian:buster-slim test/run-integration-tests.sh
+test: dev-up
+	$(CONTAINER_RUNTIME) run --rm -ti --network host --privileged --name=curl-runnings -v $$(pwd):/work -w /work $(TEST_IMAGE) test/run-integration-tests.sh
 	$(MAKE) dev-down
