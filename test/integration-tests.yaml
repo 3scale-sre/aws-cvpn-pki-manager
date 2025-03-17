@@ -1,0 +1,10 @@
+---
+cases:
+  - name: Get AWS Client VPN users
+    url: http://localhost:8080/users
+    requestMethod: GET
+    expectStatus: 200
+  - name: Get AWS Client VPN CRL
+    url: http://localhost:8080/crl
+    requestMethod: GET
+    expectStatus: 200

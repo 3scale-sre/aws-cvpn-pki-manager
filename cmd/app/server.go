@@ -9,18 +9,19 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/3scale/aws-cvpn-pki-manager/pkg/operations"
 	"github.com/3scale/aws-cvpn-pki-manager/pkg/vault"
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
 	"github.com/google/go-github/github"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/robfig/cron"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
 
@@ -39,6 +40,7 @@ type serverOptions struct {
 	AuthGithubOrg               string
 	AuthGithubUsers             []string
 	AuthGithubTeams             []string
+	LogMode                     string
 }
 
 var serverOpts serverOptions
@@ -56,13 +58,21 @@ func init() {
 	rootCmd.AddCommand(serverCmd)
 	cobra.OnInitialize(initConfig)
 
+	// Logging opts
+	serverCmd.Flags().StringVar(&serverOpts.LogMode, "log-mode", "", "production/development")
+	viper.BindPFlag("log-mode", serverCmd.Flags().Lookup("log-mode"))
+	viper.SetDefault("log-mode", "production")
+
+	// Server opts
 	serverCmd.Flags().StringVar(&serverOpts.port, "port", "", "Port to listen at")
 	viper.BindPFlag("port", serverCmd.Flags().Lookup("port"))
 	viper.SetDefault("port", "8080")
 
+	// AWS Client VPN endpoint
 	serverCmd.Flags().StringVar(&serverOpts.clientVPNEndpointID, "client-vpn-endpoint-id", "", "The AWS Client VPN endpoint ID")
 	viper.BindPFlag("client-vpn-endpoint-id", serverCmd.Flags().Lookup("client-vpn-endpoint-id"))
 
+	// Vault PKI options
 	serverCmd.Flags().StringSliceVar(&serverOpts.vaultPKIPaths, "vault-pki-paths", []string{}, "The paths where the root CA and any intermediate CAs live in Vault. Must be sorted, the rootCA PKI path has to be the first one")
 	viper.BindPFlag("vault-pki-paths", serverCmd.Flags().Lookup("vault-pki-paths"))
 	viper.SetDefault("vault-pki-paths", []string{"root-pki", "cvpn-pki"})
@@ -75,6 +85,7 @@ func init() {
 	viper.BindPFlag("vault-kv-path", serverCmd.Flags().Lookup("vault-kv-path"))
 	viper.SetDefault("vault-kv-path", "secret")
 
+	// Vault secret store for configs
 	serverCmd.Flags().StringVar(&serverOpts.CfgTplPath, "config-template-path", "", "The OpenVPN config template")
 	viper.BindPFlag("config-template-path", serverCmd.Flags().Lookup("config-template-path"))
 	viper.SetDefault("config-template-path", "./config.ovpn.tpl")
@@ -139,146 +150,142 @@ func initConfig() {
 
 func runServer(cmd *cobra.Command, args []string) {
 
+	var logger logr.Logger
+	mode := viper.GetString("log-mode")
+	if mode == "production" {
+		zl, err := zap.NewProduction()
+		if err != nil {
+			log.Panic(err)
+		}
+		logger = zapr.NewLogger(zl)
+	} else if mode == "development" {
+		zl, err := zap.NewDevelopment()
+		if err != nil {
+			log.Panic(err)
+		}
+		logger = zapr.NewLogger(zl)
+	} else {
+		log.Panicf("unkown log mode %s", mode)
+	}
+
+	var vc vault.AuthenticatedClient
 	if viper.IsSet("vault-auth-token") {
-		vc := &vault.TokenAuthenticatedClient{
+		vc = &vault.TokenAuthenticatedClient{
 			Address: viper.GetString("vault-addr"),
 			Token:   viper.GetString("vault-auth-token"),
 		}
-		start(vc)
 	} else if viper.IsSet("vault-auth-approle-role-id") &&
 		viper.IsSet("vault-auth-approle-secret-id") &&
 		viper.IsSet("vault-auth-approle-backend-path") {
 
-		vc := &vault.ApproleAuthenticatedClient{
+		vc = &vault.ApproleAuthenticatedClient{
 			Address:     viper.GetString("vault-addr"),
 			RoleID:      viper.GetString("vault-auth-approle-role-id"),
 			SecretID:    viper.GetString("vault-auth-approle-secret-id"),
 			BackendPath: viper.GetString("vault-auth-approle-backend-path"),
 		}
-		start(vc)
 	} else {
-		panic("Vault auth config options missing")
+		log.Panic("Vault auth config options missing")
 	}
+
+	// vault login
+	vc.GetClient(logger)
+
+	//start server
+	start(vc, logger)
 }
 
-func start(vc vault.AuthenticatedClient) {
+func start(vc vault.AuthenticatedClient, logger logr.Logger) {
 
 	// Start RotateCRL cron like task
 	c := cron.New()
 	c.AddFunc("@daily", func() {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			panic("Failed while creating Vault client")
+			log.Panic("Failed while creating Vault client")
 		}
-		err = operations.RotateCRL(
+		_, err = operations.RotateCRL(
 			&operations.RotateCRLRequest{
 				Client:              client,
 				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
 				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-			})
+			}, logger.WithValues("operation", "rotateCRL"))
 		if err != nil {
-			log.Println("Cron procesor failed trying to rotate the CRL")
-			log.Fatal(err)
+			logger.Error(err, "Cron procesor failed trying to rotate the CRL")
 		} else {
-			log.Println("Vault CRL rotated by cron processor")
+			logger.Info("Vault CRL rotated by cron processor")
 		}
 	})
 	c.Start()
 
 	// Start the server
 	mux := mux.NewRouter()
-	mux.HandleFunc("/crl", getCRLHandler(vc)).Methods(http.MethodGet)
-	mux.HandleFunc("/crl", updateCRLHandler(vc)).Methods(http.MethodPost)
-	mux.HandleFunc("/issue/{user}", issueClientCertificateHandler(vc)).Methods(http.MethodPost)
-	mux.HandleFunc("/revoke/{user}", revokeUserHandler(vc)).Methods(http.MethodPost)
-	mux.HandleFunc("/users", listUsersHandler(vc)).Methods(http.MethodGet)
-	mux.HandleFunc("/healthz", healthzHandler(vc)).Methods(http.MethodGet)
-	mux.HandleFunc("/readyz", readyzHandler(vc)).Methods(http.MethodGet)
+	mux.HandleFunc("/crl", getCRLHandler(vc, logger)).Methods(http.MethodGet)
+	mux.HandleFunc("/crl", updateCRLHandler(vc, logger)).Methods(http.MethodPost)
+	mux.HandleFunc("/crl/rotate", rotateCRLHandler(vc, logger)).Methods(http.MethodPost)
+	mux.HandleFunc("/issue/{user}", issueClientCertificateHandler(vc, logger)).Methods(http.MethodPost)
+	mux.HandleFunc("/revoke/{user}", revokeUserHandler(vc, logger)).Methods(http.MethodPost)
+	mux.HandleFunc("/users", listUsersHandler(vc, logger)).Methods(http.MethodGet)
+	mux.HandleFunc("/healthz", healthzHandler(vc, logger)).Methods(http.MethodGet)
+	mux.HandleFunc("/readyz", readyzHandler()).Methods(http.MethodGet)
 	// Add a logging middleware
 	loggedRouter := handlers.CombinedLoggingHandler(os.Stdout, mux)
 
 	// Start the server
-	log.Print("Started server")
-	log.Printf("Listening on port :%v", viper.GetString("port"))
-	log.Fatal(http.ListenAndServe(":"+viper.GetString("port"), authMiddleware(loggedRouter)))
+	if err := http.ListenAndServe(":"+viper.GetString("port"), authMiddleware(loggedRouter, logger)); err != nil {
+		log.Panic(err)
+	} else {
+		logger.Info("Started server")
+		logger.Info(fmt.Sprintf("Listening on port :%v", viper.GetString("port")))
+	}
 }
 
-func issueClientCertificateHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
+func issueClientCertificateHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		logger.WithValues("handler", "issueClientCertificateHandler")
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			http.Error(w, jsonOutput(map[string]string{"error": "error getting vault client:\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to get vault client",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 
 		vars := mux.Vars(r)
 
-		var temp bool
-		if _, ok := r.URL.Query()["temp"]; ok {
-			temp, err = strconv.ParseBool(r.URL.Query()["temp"][0])
-			if err != nil {
-				http.Error(w, jsonOutput(map[string]string{"error": "incorrect value for parameter 'temp'. Use one of: true/false"}), http.StatusInternalServerError)
-				return
-			}
-
+		var role string
+		if param, ok := r.URL.Query()["role"]; ok {
+			// use the role specified in the request
+			role = param[0]
 		} else {
-			temp = false
+			// use the default role
+			role = viper.GetString("vault-client-certificate-role")
 		}
 
-		if temp {
-			if role, ok := r.URL.Query()["role"]; ok {
-				//do something here
-				cfg, err := operations.IssueClientCertificate(
-					&operations.IssueCertificateRequest{
-						Client:              client,
-						VaultPKIPaths:       viper.GetStringSlice("vault-pki-paths"),
-						VaultPKIRole:        role[0],
-						Username:            vars["user"],
-						ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-						VaultKVPath:         viper.GetString("vault-kv-path"),
-						CfgTplPath:          viper.GetString("config-template-path"),
-						Temporary:           true,
-					})
-				if err != nil {
-					http.Error(w, jsonOutput(map[string]string{"error": "couldn't issue temporary client certificate for user " + vars["user"] + ":\n" + err.Error()}), http.StatusInternalServerError)
-					log.Println(err)
-					return
-				}
-				fmt.Fprintln(w, jsonOutput(map[string]string{"config": cfg}))
-			} else {
-				http.Error(w, jsonOutput(map[string]string{"error": "couldn't issue temporary client certificate, yuo need to specify a Vault PKI role"}), http.StatusBadRequest)
-				return
-			}
-
-		} else {
-			_, err = operations.IssueClientCertificate(
-				&operations.IssueCertificateRequest{
-					Client:              client,
-					VaultPKIPaths:       viper.GetStringSlice("vault-pki-paths"),
-					VaultPKIRole:        viper.GetString("vault-client-certificate-role"),
-					Username:            vars["user"],
-					ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-					VaultKVPath:         viper.GetString("vault-kv-path"),
-					CfgTplPath:          viper.GetString("config-template-path"),
-					Temporary:           false,
-				})
-			if err != nil {
-				http.Error(w, jsonOutput(map[string]string{"error": "couldn't issue client certificate for user " + vars["user"] + ":\n" + err.Error()}), http.StatusInternalServerError)
-				log.Println(err)
-				return
-			}
-			fmt.Fprintln(w, jsonOutput(map[string]string{"result": "success"}))
+		cfg, err := operations.IssueClientCertificate(
+			&operations.IssueCertificateRequest{
+				Client:              client,
+				VaultPKIPaths:       viper.GetStringSlice("vault-pki-paths"),
+				VaultPKIRole:        role,
+				Username:            vars["user"],
+				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
+				VaultKVPath:         viper.GetString("vault-kv-path"),
+				CfgTplPath:          viper.GetString("config-template-path"),
+			}, logger.WithValues("operation", "issueCertificate"))
+		if err != nil {
+			reportHttpError("unable to issue client certificate for user "+vars["user"],
+				err, http.StatusInternalServerError, w, logger)
+			return
 		}
+		fmt.Fprintln(w, jsonOutput(map[string]string{"result": "success", "config": cfg}))
 	}
 }
 
-func revokeUserHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
+func revokeUserHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			http.Error(w, jsonOutput(map[string]string{"error": "error getting vault client:\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to get vault client",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 		vars := mux.Vars(r)
@@ -288,46 +295,44 @@ func revokeUserHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
 				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
 				Username:            vars["user"],
 				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-			})
+			}, logger.WithValues("operation", "revokeUser"))
 		if err != nil {
-			log.Println(err.Error())
-			http.Error(w, jsonOutput(map[string]string{"error": "couldn't revoke user " + vars["user"] + ":\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to revoke user "+vars["user"],
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 		fmt.Fprintln(w, jsonOutput(map[string]string{"result": "success"}))
 	}
 }
 
-func getCRLHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
+func getCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			http.Error(w, jsonOutput(map[string]string{"error": "error getting vault client:\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to get vault client",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 		crl, err := operations.GetCRL(
 			&operations.GetCRLRequest{
 				Client:       client,
 				VaultPKIPath: viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
-			})
+			}, logger.WithValues("operation", "getCRL"))
 		if err != nil {
-			log.Println(err.Error())
-			http.Error(w, jsonOutput(map[string]string{"error": "couldn't retrieve the CRL:\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to retrieve the CRL",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 		fmt.Fprintln(w, jsonOutput(map[string]string{"crl": string(crl)}))
 	}
 }
 
-func updateCRLHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
+func updateCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			http.Error(w, jsonOutput(map[string]string{"error": "error gettings vault client:\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to get vault client",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 		crl, err := operations.UpdateCRL(
@@ -335,10 +340,10 @@ func updateCRLHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
 				Client:              client,
 				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
 				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
-			})
+			}, logger.WithValues("operation", "updateCRL"))
 		if err != nil {
-			log.Println(err.(awserr.Error).Code())
-			http.Error(w, jsonOutput(map[string]string{"error": "CRL could not be updated:\n" + err.Error()}), http.StatusInternalServerError)
+			reportHttpError("unable to update CRL",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 
@@ -346,34 +351,64 @@ func updateCRLHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
 	}
 }
 
-func listUsersHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
+func rotateCRLHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			http.Error(w, jsonOutput(map[string]string{"error": "error gettings vault client:\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to get vault client",
+				err, http.StatusInternalServerError, w, logger)
+			return
+		}
+		crl, err := operations.RotateCRL(
+			&operations.RotateCRLRequest{
+				Client:              client,
+				VaultPKIPath:        viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
+				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),
+			}, logger.WithValues("operation", "rotateCRL"))
+		if err != nil {
+			reportHttpError("unable to update CRL",
+				err, http.StatusInternalServerError, w, logger)
+			return
+		}
+
+		fmt.Fprintln(w, jsonOutput(map[string]string{"crl": string(crl)}))
+	}
+}
+
+func listUsersHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		client, err := vc.GetClient(logger)
+		if err != nil {
+			reportHttpError("unable to get vault client",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 		users, err := operations.ListUsers(
 			&operations.ListUsersRequest{
 				Client:       client,
 				VaultPKIPath: viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
-			})
+			}, logger.WithValues("operation", "listUSers"))
 		if err != nil {
-			http.Error(w, jsonOutput(map[string]string{"error": "could not retrieve the user list:\n" + err.Error()}), http.StatusInternalServerError)
-			log.Println(err)
+			reportHttpError("unable to retrieve the user list",
+				err, http.StatusInternalServerError, w, logger)
 			return
 		}
 		b, err := json.MarshalIndent(users, "", "  ")
+		if err != nil {
+			reportHttpError("unable to parse client list",
+				err, http.StatusInternalServerError, w, logger)
+			return
+		}
 		fmt.Fprintln(w, string(b))
 	}
 }
 
-func healthzHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
+func healthzHandler(vc vault.AuthenticatedClient, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		client, err := vc.GetClient()
+		client, err := vc.GetClient(logger)
 		if err != nil {
-			log.Println(err)
+			reportHttpError("/healthz failed",
+				err, http.StatusInternalServerError, w, logger, "status", "ko")
 			return
 		}
 		// Try to do a ListUsers to check health
@@ -381,12 +416,10 @@ func healthzHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
 			&operations.ListUsersRequest{
 				Client:       client,
 				VaultPKIPath: viper.GetStringSlice("vault-pki-paths")[len(viper.GetStringSlice("vault-pki-paths"))-1],
-			})
+			}, logger.WithValues("operation", "healthz:listUsers"))
 		if err != nil {
-			http.Error(w, jsonOutput(map[string]string{
-				"status": "ko",
-				"error":  err.Error()}),
-				http.StatusInternalServerError)
+			reportHttpError("/healthz failed",
+				err, http.StatusInternalServerError, w, logger, "status", "ko")
 			return
 		}
 
@@ -394,33 +427,25 @@ func healthzHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
 	}
 }
 
-func readyzHandler(vc vault.AuthenticatedClient) http.HandlerFunc {
+func readyzHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "OK")
 	}
 }
 
-func jsonOutput(rsp map[string]string) string {
-	b, err := json.MarshalIndent(rsp, "", "  ")
-	if err != nil {
-		log.Panic("Error marhsalling the response json")
-	}
-	return string(b)
-}
-
-func authMiddleware(next http.Handler) http.HandlerFunc {
+func authMiddleware(next http.Handler, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var err error
 		var token string
 
 		// Check if this is a z endpoint (ie /healthz) in which case
 		// auth should be not enforced
-		zEndpoint, err := regexp.MatchString("(.*)z$", r.URL.Path)
+		zEndpoint, _ := regexp.MatchString("(.*)z$", r.URL.Path)
 
 		// GitHub auth enabled
 		if !zEndpoint && viper.IsSet("auth-github-org") {
 
-			gh := GithubAuthOpts{
+			gh := githubAuthOpts{
 				Organization: viper.GetString("auth-github-org"),
 			}
 
@@ -431,8 +456,7 @@ func authMiddleware(next http.Handler) http.HandlerFunc {
 				if len(h) == 2 && h[0] == "Bearer" {
 					token = h[1]
 				} else {
-					err = errors.New("malformed 'Authentication' header")
-					http.Error(w, jsonOutput(map[string]string{"error": "unauthenticated: " + err.Error()}), http.StatusInternalServerError)
+					reportHttpError("unauthenticated", err, http.StatusUnauthorized, w, logger)
 					return
 				}
 			}
@@ -449,10 +473,10 @@ func authMiddleware(next http.Handler) http.HandlerFunc {
 				gh.AllowedTeams = []string{}
 			}
 
-			err = GithubAuth(&gh)
+			err = githubAuth(&gh)
 
 			if err != nil {
-				http.Error(w, jsonOutput(map[string]string{"error": "unauthenticated: " + err.Error()}), http.StatusInternalServerError)
+				reportHttpError("unauthenticated", err, http.StatusUnauthorized, w, logger)
 				return
 			}
 		}
@@ -461,17 +485,17 @@ func authMiddleware(next http.Handler) http.HandlerFunc {
 	}
 }
 
-// GithubAuthOpts configured this auth backend
-type GithubAuthOpts struct {
+// githubAuthOpts configured this auth backend
+type githubAuthOpts struct {
 	Token        string
 	Organization string
 	AllowedUsers []string
 	AllowedTeams []string
 }
 
-// GithubAuth validates if the provided Github personal token
+// githubAuth validates if the provided Github personal token
 // has access to the server by talking to the Github API.
-func GithubAuth(gh *GithubAuthOpts) error {
+func githubAuth(gh *githubAuthOpts) error {
 
 	allowedUser := false
 	allowedTeam := false
@@ -558,7 +582,7 @@ func GithubAuth(gh *GithubAuthOpts) error {
 					break
 				}
 			}
-			if allowedTeam == true {
+			if allowedTeam {
 				break
 			}
 		}
@@ -575,13 +599,41 @@ func GithubAuth(gh *GithubAuthOpts) error {
 
 	// If neither AllowedTeams not AllowedUsers is set, any user
 	// that belongs to the organization is allowed
-	if len(gh.AllowedTeams) == 0 && len(gh.AllowedUsers) == 0 && org != nil {
+	if len(gh.AllowedTeams) == 0 && len(gh.AllowedUsers) == 0 {
 		return nil
-	} else if len(gh.AllowedUsers) > 0 && allowedUser && org != nil {
+	} else if len(gh.AllowedUsers) > 0 && allowedUser {
 		return nil
-	} else if len(gh.AllowedTeams) > 0 && allowedTeam && org != nil {
+	} else if len(gh.AllowedTeams) > 0 && allowedTeam {
 		return nil
 	}
 
-	return errors.New("The user does not match any of the allowed users/teams")
+	return errors.New("the user does not match any of the allowed users/teams")
+}
+
+func jsonOutput(rsp map[string]string) string {
+	b, err := json.MarshalIndent(rsp, "", "  ")
+	if err != nil {
+		log.Panic("Error marhsalling the response json")
+	}
+	return string(b)
+}
+
+func reportHttpError(msg string, err error, statusCode int, w http.ResponseWriter, logger logr.Logger, keys ...string) {
+	if len(keys)%2 != 0 {
+		log.Panic("odd number of extra keys in call to function ")
+	}
+
+	rsp := map[string]string{
+		"msg":   msg,
+		"error": err.Error(),
+	}
+
+	for i, k := range keys {
+		if i%2 != 0 {
+			rsp[k] = keys[i+1]
+		}
+	}
+
+	http.Error(w, jsonOutput(rsp), statusCode)
+	logger.Error(err, msg)
 }

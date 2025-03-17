@@ -26,20 +26,6 @@ This project works under the following premises:
 * Each user will only have one valid certificate at a given time. This means that when a new certificate is issued for an existent client, all other certificates that the user might have will be revoked, and only the new one will be valid from that moment on.
 
 
-## Getting Started (WIP)
-
-The fastest way to try out ACPM is to use the provided example in `examples/eks` which contains the terraform resources to install all the setup inside an AWS EKS managed Kubernetes cluster. This terraform will deploy the following resources for you:
-
-* A VPC with an EKS cluster inside it.
-* A Route53 hosted zone to host the cluster DNS records
-* A Client VPN endpoint connected to the VPC
-* A Vault instance inside the cluster, already configured with the required backends
-* A deployment of ACPM to manage the PKI
-
-This will provide you a full functioning environment to test ACPM capabilities.
-
-A serveless deployment of ACPM using Lambda and API Gateway will come in the future, stay tuned!
-
 ## Vault permissions
 
 The following vault policy is required for ACPM:
@@ -129,3 +115,66 @@ curl -H "Authorization: Bearer <github-personal-access-token>" http://localhost:
 | --auth-github-org                 | ACPM_AUTH_GITHUB_ORG                 | N/A                       | no       | This flag activates GitHub authentication with personal access token to the ACPM server. All GitHub tokens that are members of the org passed as value will be granted access |
 | --auth-github-teams               | ACPM_AUTH_GITHUB_TEAMS               | N/A                       | no       | All GitHub tokens that are members of the team passed as value will be granted access                                                                                         |
 | --auth-github-users               | ACPM_AUTH_GITHUB_USERS               | N/A                       | no       | All GitHub tokens that match any of the users in the list passed as value will be granted access                                                                              |
+
+## Usage
+
+
+#### API operations
+
+##### List users
+
+List all the users and all the certificates binded to them. Just a single certificate is valid for a user at a given time. If the user has been revoked, no valid certificates will be shown for that user.
+
+```bash
+▶ curl -s http://localhost:8080/users
+```
+
+##### Get Client Revokation List (CRL)
+
+Retrieves the CRL from the Vault PKI storage backend.
+
+```bash
+▶ curl -s http://localhost:8080/crl
+```
+
+The CRL can be inspected with openssl cli tool.
+
+```bash
+curl -s http://localhost:8080/crl | jq -r .crl | openssl crl -in - -text -noout
+```
+
+##### Update Client Revokation List (CRL)
+
+Retrieves the CRL from Vault's PKI secret engine and uploads it to the Client VPN endpoint, to keep them in sync. VPN admins are typically not required to call this endpoint:
+* Any other operation that triggers revocation of client certificates triggers this action, to keep the CRL always in sync.
+* There is a daily operation to rotate and resync the CRL to avoid CRL expiration. Just make sure the duration of your CRL is at least 24h.
+
+The update endpoint won't do anything if the CRL is already in sync
+
+##### Rotate Client Revokation List (CRL)
+
+Calls the /pki/crl/rotate Vault endpoint to renew the CRL. The performs an Update Client Revokation List operation. This operation is run daily by acpm, so it is not required that admins call this endpoint manually.
+
+```bash
+▶ curl -s http://localhost:8080/crl/rotate -XPOST
+```
+
+##### Issue a new certificate
+
+Issues a new certificate for the given GitHub user. The name passed in the request must match the name of the user in GitHub. The resulting certificate is stored in Vault PKI engine, and the user config is stored in Vault's kv2 (key-value) engine, under the path `/secret/<config-template-path>/<name>/config.ovpn`.
+
+```bash
+▶ curl http://localhost:8080/issue/user -XPOST
+```
+
+When a new certificate is issued for a user, all the other certificates (if any) that were previously issued for that same user are revoked by ACPM and the CRL gets updated in the Client VPN endpoint.
+
+##### Revoke a user
+
+This operation revokes all the certificates for a given user:
+
+```bash
+▶ curl http://localhost:8080/revoke/roivaz -XPOST
+```
+
+New certificates can still be issued for this user if required.

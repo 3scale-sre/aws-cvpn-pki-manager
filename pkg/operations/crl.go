@@ -1,14 +1,16 @@
 package operations
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
-	"log"
+	"io"
 	"reflect"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/3scale/aws-cvpn-pki-manager/pkg/config"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/go-logr/logr"
 	"github.com/hashicorp/vault/api"
 )
 
@@ -20,14 +22,20 @@ type GetCRLRequest struct {
 }
 
 // GetCRL return the Client Revocation List PEM as a []byte
-func GetCRL(r *GetCRLRequest) ([]byte, error) {
-	req := r.Client.NewRequest("GET", fmt.Sprintf("/v1/%s/crl/pem", r.VaultPKIPath))
-	rsp, err := r.Client.RawRequest(req)
+func GetCRL(r *GetCRLRequest, logger logr.Logger) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), config.VaultApiTimeout)
+	defer cancel()
+	rsp, err := r.Client.Logical().ReadRawWithContext(ctx, fmt.Sprintf("/%s/crl/pem", r.VaultPKIPath))
 	if err != nil {
+		logger.Error(err, fmt.Sprintf("unable to retrieve CRL from Vault at path /%s/crl/pem", r.VaultPKIPath))
 		return nil, err
 	}
 	defer rsp.Body.Close()
-	data, err := ioutil.ReadAll(rsp.Body)
+	data, err := io.ReadAll(rsp.Body)
+	if err != nil {
+		logger.Error(err, fmt.Sprintf("unable to read response body in call to /v1/%s/crl/pem", r.VaultPKIPath))
+	}
+
 	return data, nil
 }
 
@@ -42,7 +50,7 @@ type UpdateCRLRequest struct {
 // UpdateCRL maintains the CRL to keep just one active certificte per
 // VPN user. This will always be the one emitted at a later date. Users
 // can also have all their certificates revoked.
-func UpdateCRL(r *UpdateCRLRequest) ([]byte, error) {
+func UpdateCRL(r *UpdateCRLRequest, logger logr.Logger) ([]byte, error) {
 
 	// Get the list of users
 	users, err := ListUsers(
@@ -50,14 +58,14 @@ func UpdateCRL(r *UpdateCRLRequest) ([]byte, error) {
 			Client:              r.Client,
 			VaultPKIPath:        r.VaultPKIPath,
 			ClientVPNEndpointID: r.ClientVPNEndpointID,
-		})
+		}, logger)
 	if err != nil {
 		return nil, err
 	}
 
 	//For each user, get the list of certificates, and revoke all of them but the latest
 	for _, crts := range users {
-		err := revokeUserCertificates(r.Client, r.VaultPKIPath, crts, false)
+		err := revokeUserCertificates(r.Client, r.VaultPKIPath, crts, false, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -68,18 +76,32 @@ func UpdateCRL(r *UpdateCRLRequest) ([]byte, error) {
 		&GetCRLRequest{
 			Client:       r.Client,
 			VaultPKIPath: r.VaultPKIPath,
-		})
-
-	// Upload new CRL to AWS Client VPN endpoint
-	svc := ec2.New(session.New())
-
-	cvpnCRL, err := svc.ExportClientVpnClientCertificateRevocationList(
-		&ec2.ExportClientVpnClientCertificateRevocationListInput{
-			ClientVpnEndpointId: aws.String(r.ClientVPNEndpointID),
-		})
+		}, logger)
 	if err != nil {
 		return nil, err
 	}
+
+	// Upload new CRL to AWS Client VPN endpoint
+	ctx1, cancel1 := context.WithTimeout(context.Background(), config.AwsApiTimeout)
+	defer cancel1()
+	cfg, err := awsconfig.LoadDefaultConfig(ctx1)
+	if err != nil {
+		logger.Error(err, "unable to load AWS EC2 client")
+		return nil, err
+	}
+	svc := ec2.NewFromConfig(cfg)
+	cvpnCRL, err := svc.ExportClientVpnClientCertificateRevocationList(ctx1,
+		&ec2.ExportClientVpnClientCertificateRevocationListInput{
+			ClientVpnEndpointId: &r.ClientVPNEndpointID,
+		})
+	if err != nil {
+		logger.Error(err, "error in AWS call exportClientVpnClientCertificateRevocationList")
+		return nil, err
+	}
+
+	//reset the timeout
+	ctx2, cancel2 := context.WithTimeout(context.Background(), config.AwsApiTimeout)
+	defer cancel2()
 
 	// Handle the case that no CRL has been uploaded yet. The API
 	// will return a struct without the 'CertificateRevocationList'
@@ -88,29 +110,31 @@ func UpdateCRL(r *UpdateCRLRequest) ([]byte, error) {
 	if reflect.ValueOf(*cvpnCRL).FieldByName("CertificateRevocationList").Elem().IsValid() {
 		if *cvpnCRL.CertificateRevocationList != string(crl) {
 			// CRL needs update
-			_, err = svc.ImportClientVpnClientCertificateRevocationList(
+			_, err = svc.ImportClientVpnClientCertificateRevocationList(ctx2,
 				&ec2.ImportClientVpnClientCertificateRevocationListInput{
 					CertificateRevocationList: aws.String(string(crl)),
 					ClientVpnEndpointId:       aws.String(r.ClientVPNEndpointID),
 				})
 			if err != nil {
+				logger.Error(err, "error in AWS call importClientVpnClientCertificateRevocationListInput")
 				return nil, err
 			}
-			log.Println("Updated CRL in AWS Client VPN endpoint")
+			logger.Info("Updated CRL in AWS Client VPN endpoint")
 		} else {
-			log.Println("CRL does not need to be updated")
+			logger.Info("CRL does not need to be updated")
 		}
 	} else {
 		// CRL first time import
-		_, err = svc.ImportClientVpnClientCertificateRevocationList(
+		_, err = svc.ImportClientVpnClientCertificateRevocationList(ctx2,
 			&ec2.ImportClientVpnClientCertificateRevocationListInput{
 				CertificateRevocationList: aws.String(string(crl)),
 				ClientVpnEndpointId:       aws.String(r.ClientVPNEndpointID),
 			})
-		log.Println("First upload of CRL to the CPN endpoint")
 		if err != nil {
+			logger.Error(err, "error in AWS call importClientVpnClientCertificateRevocationListInput")
 			return nil, err
 		}
+		logger.Info("First upload of the CRL to the Client VPN endpoint")
 	}
 
 	return crl, nil
@@ -124,23 +148,25 @@ type RotateCRLRequest struct {
 	ClientVPNEndpointID string
 }
 
-func RotateCRL(r *RotateCRLRequest) error {
+func RotateCRL(r *RotateCRLRequest, logger logr.Logger) ([]byte, error) {
 
-	req := r.Client.NewRequest("GET", fmt.Sprintf("/v1/%s/crl/rotate", r.VaultPKIPath))
-	_, err := r.Client.RawRequest(req)
+	ctx, cancel := context.WithTimeout(context.Background(), config.VaultApiTimeout)
+	defer cancel()
+	_, err := r.Client.Logical().ReadRawWithContext(ctx, fmt.Sprintf("/%s/crl/rotate", r.VaultPKIPath))
 	if err != nil {
-		return err
+		logger.Error(err, fmt.Sprintf("error in Vault call to /%s/crl/rotate", r.VaultPKIPath))
+		return nil, err
 	}
 
-	_, err = UpdateCRL(
+	crl, err := UpdateCRL(
 		&UpdateCRLRequest{
 			Client:              r.Client,
 			VaultPKIPath:        r.VaultPKIPath,
 			ClientVPNEndpointID: r.ClientVPNEndpointID,
-		})
+		}, logger)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return crl, nil
 }
