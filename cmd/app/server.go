@@ -32,6 +32,7 @@ type serverOptions struct {
 	vaultPKIPaths               []string
 	vaultClientCrtRole          string
 	vaultKVPath                 string
+	vaultKVConfigKey            string
 	CfgTplPath                  string
 	vaultAuthToken              string
 	vaultAuthApproleRoleID      string
@@ -85,7 +86,10 @@ func init() {
 	viper.BindPFlag("vault-kv-path", serverCmd.Flags().Lookup("vault-kv-path"))
 	viper.SetDefault("vault-kv-path", "secret")
 
-	// Vault secret store for configs
+	serverCmd.Flags().StringVar(&serverOpts.vaultKVConfigKey, "vault-kv-config-key", "", "The Vault path for the kv (v2) storage engine where VPN configs will be stored")
+	viper.BindPFlag("vault-kv-config-key", serverCmd.Flags().Lookup("vault-kv-config-key"))
+	viper.SetDefault("vault-kv-config-key", "config.ovpn")
+
 	serverCmd.Flags().StringVar(&serverOpts.CfgTplPath, "config-template-path", "", "The OpenVPN config template")
 	viper.BindPFlag("config-template-path", serverCmd.Flags().Lookup("config-template-path"))
 	viper.SetDefault("config-template-path", "./config.ovpn.tpl")
@@ -123,6 +127,7 @@ func initConfig() {
 		"vault-pki-paths",
 		"vault-client-certificate-role",
 		"vault-kv-path",
+		"vault-kv-config-key",
 		"config-template-path",
 	}
 
@@ -265,6 +270,7 @@ func issueClientCertificateHandler(vc vault.AuthenticatedClient, logger logr.Log
 			&operations.IssueCertificateRequest{
 				Client:              client,
 				VaultPKIPaths:       viper.GetStringSlice("vault-pki-paths"),
+				VaultKVConfigKey:    viper.GetString("vault-kv-config-key"),
 				VaultPKIRole:        role,
 				Username:            vars["user"],
 				ClientVPNEndpointID: viper.GetString("client-vpn-endpoint-id"),

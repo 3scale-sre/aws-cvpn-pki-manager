@@ -26,6 +26,7 @@ type IssueCertificateRequest struct {
 	VaultPKIRole        string
 	ClientVPNEndpointID string
 	VaultKVPath         string
+	VaultKVConfigKey    string
 	CfgTplPath          string
 }
 
@@ -113,9 +114,9 @@ func IssueClientCertificate(r *IssueCertificateRequest, logger logr.Logger) (str
 	payload["data"] = map[string]string{
 		"content": config.String(),
 	}
-	_, err = r.Client.Logical().Write(fmt.Sprintf("%s/data/users/%s/config.ovpn", r.VaultKVPath, r.Username), payload)
+	_, err = r.Client.Logical().Write(fmt.Sprintf("%s/data/users/%s/%s", r.VaultKVPath, r.Username, r.VaultKVConfigKey), payload)
 	if err != nil {
-		logger.Error(err, fmt.Sprintf("unable to update %s/data/users/%s/config.ovpn in KV2 store", r.VaultKVPath, r.Username))
+		logger.Error(err, fmt.Sprintf("unable to update %s/data/users/%s/%s in KV2 store", r.VaultKVPath, r.Username, r.VaultKVConfigKey))
 		return "", err
 	}
 
