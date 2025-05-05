@@ -1,5 +1,5 @@
 TAG	?= local
-IMAGE	?= quay.io/3scale/aws-cvpn-pki-manager
+IMAGE	?= quay.io/3scale-sre/aws-cvpn-pki-manager
 CONTAINER_TOOL ?= podman
 
 .PHONY: help
@@ -11,7 +11,7 @@ help:
 
 # MULTI-PLATFORM BUILD/PUSH FUNCTIONS
 # NOTE IF USING DOCKER (https://docs.docker.com/build/building/multi-platform/#prerequisites):
-#   The "classic" image store of the Docker Engine does not support multi-platform images. 
+#   The "classic" image store of the Docker Engine does not support multi-platform images.
 #   Switching to the containerd image store ensures that your Docker Engine can push, pull,
 #   and build multi-platform images.
 
@@ -64,7 +64,7 @@ container-push:
 # MULTI-PLATFORM BUILD/PUSH
 PLATFORMS ?= linux/arm64,linux/amd64
 .PHONY: container-buildx
-container-buildx: ## cross-platfrom build 
+container-buildx: ## cross-platfrom build
 	$(call container-build-multiplatform,$(IMAGE):$(TAG),$(CONTAINER_TOOL),Dockerfile,.,$(PLATFORMS))
 
 .PHONY: container-pushx

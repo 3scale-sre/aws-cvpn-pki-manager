@@ -14,7 +14,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            quay.io/3scale/aws-cvpn-pki-manager
+            quay.io/3scale-sre/aws-cvpn-pki-manager
           tags: |
             type=semver,pattern={{raw}}
 

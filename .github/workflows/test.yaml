@@ -30,4 +30,4 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: false
-          tags: quay.io/3scale/aws-cvpn-pki-manager:test
+          tags: quay.io/3scale-sre/aws-cvpn-pki-manager:test
