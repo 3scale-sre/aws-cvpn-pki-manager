@@ -15,14 +15,13 @@ import (
 	"github.com/3scale/aws-cvpn-pki-manager/pkg/vault"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v90/github"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/robfig/cron"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
-	"golang.org/x/oauth2"
 )
 
 // serverOptions is the options for the command
@@ -507,12 +506,10 @@ func githubAuth(gh *githubAuthOpts) error {
 	allowedTeam := false
 
 	ctx := context.Background() // TODO: change by context.WithTimeout()
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: gh.Token},
-	)
-	tc := oauth2.NewClient(ctx, ts)
-
-	client := github.NewClient(tc)
+	client, err := github.NewClient(github.WithAuthToken(gh.Token))
+	if err != nil {
+		return err
+	}
 
 	// Get the user
 	user, _, err := client.Users.Get(ctx, "")
