@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/3scale/aws-cvpn-pki-manager/pkg/operations"
@@ -438,17 +437,24 @@ func readyzHandler() http.HandlerFunc {
 	}
 }
 
+// unauthenticatedPaths are the endpoints that never require authentication.
+var unauthenticatedPaths = map[string]struct{}{
+	"/healthz": {},
+	"/readyz":  {},
+}
+
 func authMiddleware(next http.Handler, logger logr.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var err error
 		var token string
 
-		// Check if this is a z endpoint (ie /healthz) in which case
-		// auth should be not enforced
-		zEndpoint, _ := regexp.MatchString("(.*)z$", r.URL.Path)
+		// Probe endpoints are exempt from auth. Match exact paths only: any
+		// suffix/pattern match would also exempt routes with user-controlled
+		// segments (ie /issue/{user}).
+		_, unauthenticated := unauthenticatedPaths[r.URL.Path]
 
 		// GitHub auth enabled
-		if !zEndpoint && viper.IsSet("auth-github-org") {
+		if !unauthenticated && viper.IsSet("auth-github-org") {
 
 			gh := githubAuthOpts{
 				Organization: viper.GetString("auth-github-org"),
@@ -461,7 +467,7 @@ func authMiddleware(next http.Handler, logger logr.Logger) http.HandlerFunc {
 				if len(h) == 2 && h[0] == "Bearer" {
 					token = h[1]
 				} else {
-					reportHttpError("unauthenticated", err, http.StatusUnauthorized, w, logger)
+					reportHttpError("unauthenticated", errors.New("malformed Authorization header"), http.StatusUnauthorized, w, logger)
 					return
 				}
 			}
